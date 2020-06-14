@@ -1,99 +1,105 @@
 require 'rest-client'
-require 'rss'
 require 'json'
-require 'htmlentities'
+require_relative 'error'
 
-def fetch_zhihu_content(url, uid)
-  resp = RestClient.get(url, {
-    'Referer': "https://www.zhihu.com/people/#{uid}",
-    'x-api-version': '3.0.40',
-    'x-requested-with': 'fetch',
-    'Host': 'www.zhihu.com',
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:77.0) Gecko/20100101 Firefox/77.0',
-  })
+class ZhihuActivity
+  attr_reader :action, :actor, :created_at, :id
+  attr_reader :title, :link, :content, :content_type
 
-  if resp.code != 200
-    abort 'Failed to fetch'
+  def initialize(activity)
+    @action = activity['action_text']
+    @actor = activity.dig('actor', 'name')
+    @created_at = Time.at(activity['created_time'].to_i)
+    @id = acvitity['id']
+    get_variant_fields activity
   end
 
-  JSON.parse(resp)
-end
+  private
 
-def parse_zhihu_item(activity, maker)
-  id = activity['id']
-  created = activity['created_time']
-  author = activity.dig('actor', 'name') + activity['action_text']
-
-  case activity['verb']
-  when 'ANSWER_VOTE_UP'
-    title = activity.dig('target', 'question', 'title')
-    link = activity.dig('target', 'url').gsub('api', 'www').gsub('answers', 'answer')
-    description = activity.dig('target', 'excerpt')
-  when 'ANSWER_CREATE'
-    title = activity.dig('target', 'question', 'title')
-    title = activity.dig('target', 'question', 'title')
-    link = activity.dig('target', 'url').gsub('api', 'www').gsub('answers', 'answer')
-    description = activity.dig('target', 'content')
-  when 'QUESTION_FOLLOW'
-    title = activity.dig('target', 'title')
-    link = activity.dig('target', 'url').gsub('api', 'www').gsub('questions', 'question')
-    description = ''
-  when 'MEMBER_CREATE_ARTICLE'
-    title = activity.dig('target', 'title')
-    link = activity.dig('target', 'url').gsub('api', 'zhuanlan').gsub('articles', 'p')
-    description = activity.dig('target', 'content')
-  when 'MEMBER_CREATE_PIN'
-    title = activity.dig('target', 'excerpt_title')
-    link = activity.dig('target', 'url').gsub('api', 'www').gsub('pins', 'pin')
-    description = activity.dig('target', 'excerpt_new')
-  when 'MEMBER_VOTEUP_ARTICLE'
-    title = activity.dig('target', 'title')
-    link = activity.dig('target', 'url').gsub('api', 'zhuanlan').gsub('articles', 'p')
-    description = activity.dig('target', 'content')
-  end
-
-  if !link || !title || !description
-    STDERR.puts "MISSING for type: #{activity['verb']}"
-    return
-  end
-
-  maker.items.new_item do |item|
-    item.link = link
-    item.title = title
-    item.updated = Time.at(created).to_s
-    item.author = author
-    item.id = id
-    item.description = HTMLEntities.new.decode description
-  end
-end
-
-def make_zhihu_atom(uid, feed_name)
-  base_url = "https://www.zhihu.com/api/v3/feed/members/#{uid}/activities"
-  url = "#{base_url}?limit=7&desktop=true"
-
-  init_resp = fetch_zhihu_content(url, uid)
-  name = init_resp['data'][0]['actor']['name']
-  next_url = init_resp['paging']['next']
-
-  RSS::Maker.make('atom') do |maker|
-    maker.channel.author = uid
-    maker.channel.updated = Time.now.to_s
-    maker.channel.about = feed_name
-    maker.channel.title = "#{name}的知乎动态"
-
-    init_resp['data'].each do |activity|
-      parse_zhihu_item(activity, maker)
+  def get_variant_fields(activity)
+    @action_type = activity['verb']
+    case @action_type
+    when 'ANSWER_VOTE_UP'   @content_type = :answer
+    when 'ANSWER_CREATE'    @content_type = :answer
+    when 'QUESTION_FOLLOW'  @content_type = :question
+    when 'MEMBER_CREATE_ARTICLE' @content_type = :article
+    when 'MEMBER_VOTEUP_ARTICLE' @content_type = :article
+    when 'MEMBER_CREATE_PIN'     @content_type = :pin
+    else raise ContentParseError, "Unknown action type: #{@action_type}"
     end
-    3.times do
-      resp = fetch_zhihu_content(next_url, uid)
-      resp['data'].each do |activity|
-        parse_zhihu_item(activity, maker)
-      end
-      next_url = resp['paging']['next']
-      sleep 1
+
+    api_url = activity.dig('target', 'url')
+
+    if @content_type == :answer
+      @title = activity.dig('target', 'question', 'title')
+      @link = api_url.gsub('api', 'www').gsub('answers', 'answer')
+      @content = activity.dig('target', 'content')
+    end
+
+    if @content_type == :pin
+      @title = activity.dig('target', 'excerpt_title')
+      @link = api_url.gsub('api', 'www').gsub('pins', 'pin')
+      # TODO: More content types in PIN?
+      @content = activity.dig('target', 'content').map { |l| "<p>#{l}</p>" }.join
+    end
+
+    if @content_type == :article
+      @title = title = activity.dig('target', 'title')
+      @link = api_url.gsub('api', 'zhuanlan').gsub('articles', 'p')
+      @content = activity.dig('target', 'content')
+    end
+
+    if @content_type == :question
+      @title = activity.dig('target', 'title')
+      @link = api_url.gsub('api', 'www').gsub('questions', 'question')
     end
   end
 end
 
-# Example
-# puts make_zhihu_atom("SOMEONE's ID", "ARBITRARY URL")
+class ZhihuFetcher
+  attr_reader :user_id, :items
+
+  def initialize(id)
+    @user_id = id
+    @feed_num = 20
+    @fetch_num = 7
+  end
+
+  def get_items
+    # TODO: Filter by num of items
+    @items = []
+    fetch_zhihu_content(activities_url(@user_id), @user_id)
+    parse_and_fetch_rest((@feed_num / @fetch_num.to_f).ceil)
+  end
+
+  private
+
+  def parse_and_fetch_rest(total)
+    @response['data'].each do |item|
+      @items << ZhihuActivity.new(item)
+    end
+    return if total <= 1 || @response.dig('paging', 'is_end')
+    next_url = @response['paging']['next']
+    fetch_zhihu_content(next_url, @user_id)
+  end
+
+  def activities_url(uid)
+    "https://www.zhihu.com/api/v3/feed/members/#{uid}/activities?limit=#{fetch_num}&desktop=true"
+  end
+
+  def fetch_zhihu_content(url, uid)
+    resp = RestClient.get(url, {
+      'Referer': "https://www.zhihu.com/people/#{uid}",
+      'x-api-version': '3.0.40',
+      'x-requested-with': 'fetch',
+      'Host': 'www.zhihu.com',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:77.0) Gecko/20100101 Firefox/77.0',
+    })
+
+    if resp.code != 200
+      raise ContentFetchError, resp
+    end
+
+    @response = JSON.parse(resp)
+  end
+end
